@@ -1,0 +1,28 @@
+{
+  "name": "camoufox-browser",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Camoufox-only browser runtime for agents with persistent sessions, network introspection, and downloads",
+  "keywords": [
+    "pi-package"
+  ],
+  "pi": {
+    "skills": [
+      "./skills"
+    ]
+  },
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "camoufox-js": "^0.9.1",
+    "express": "^4.21.2",
+    "playwright-core": "^1.52.0"
+  }
+}
