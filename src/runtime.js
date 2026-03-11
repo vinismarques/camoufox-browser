@@ -113,6 +113,7 @@ export class BrowserRuntime {
     this.sessions = new Map();
     this.tabs = new Map();
     this.tabLocks = new Map();
+    this.profileLocks = new Map();
 
     this.eventSeq = 1;
 
@@ -228,52 +229,29 @@ export class BrowserRuntime {
 
     const headless = options.headless ?? this.config.headless;
 
-    let context;
-    let ownsBrowser = false;
-    let profileDir = null;
-
     if (persistent) {
-      const existing = this.findPersistentSessionByProfile(profileName);
-      if (existing) {
-        if (authMode === 'shared' && onProfileBusy === 'reuse') {
-          existing.lastAccessAt = Date.now();
-          return this.serializeSession(existing, {
-            reused: true,
-            requestedHeadless: headless,
-            requestedSessionId: sessionId
-          });
+      return this.withProfileLock(profileName, async () => {
+        if (this.sessions.has(sessionId)) {
+          const err = new Error(`Session already exists: ${sessionId}`);
+          err.statusCode = 409;
+          throw err;
         }
 
-        if (authMode === 'shared' && onProfileBusy === 'handoff') {
-          await this.closeSession(existing.id);
-        } else {
-          throw this.createProfileBusyError(profileName, existing.profileDir, existing.id);
-        }
-      }
-
-      profileDir = path.join(this.config.profilesDir, sanitizeFileName(profileName));
-      await fs.mkdir(profileDir, { recursive: true });
-      const launch = await this.buildCamoufoxLaunchOptions(headless);
-      try {
-        context = await firefox.launchPersistentContext(profileDir, {
-          ...launch,
-          viewport: { width: 1440, height: 900 },
-          acceptDownloads: true
+        return this.createPersistentSession({
+          sessionId,
+          authMode,
+          profileName,
+          onProfileBusy,
+          headless
         });
-      } catch (error) {
-        if (this.isLikelyProfileBusyLaunchError(error)) {
-          throw this.createProfileBusyError(profileName, profileDir);
-        }
-        throw error;
-      }
-      ownsBrowser = true;
-    } else {
-      const browser = await this.ensureSharedBrowser();
-      context = await browser.newContext({
-        viewport: { width: 1440, height: 900 },
-        acceptDownloads: true
       });
     }
+
+    const browser = await this.ensureSharedBrowser();
+    const context = await browser.newContext({
+      viewport: { width: 1440, height: 900 },
+      acceptDownloads: true
+    });
 
     const session = {
       id: sessionId,
@@ -282,9 +260,65 @@ export class BrowserRuntime {
       persistent,
       authMode,
       profileName,
+      profileDir: null,
+      context,
+      ownsBrowser: false,
+      headless,
+      tabs: new Map()
+    };
+
+    this.sessions.set(session.id, session);
+
+    return this.serializeSession(session, { reused: false });
+  }
+
+  async createPersistentSession({ sessionId, authMode, profileName, onProfileBusy, headless }) {
+    const existing = this.findPersistentSessionByProfile(profileName);
+    if (existing) {
+      if (authMode === 'shared' && onProfileBusy === 'reuse') {
+        existing.lastAccessAt = Date.now();
+        return this.serializeSession(existing, {
+          reused: true,
+          requestedHeadless: headless,
+          requestedSessionId: sessionId
+        });
+      }
+
+      if (authMode === 'shared' && onProfileBusy === 'handoff') {
+        await this.closeSession(existing.id);
+      } else {
+        throw this.createProfileBusyError(profileName, existing.profileDir, existing.id);
+      }
+    }
+
+    const profileDir = path.join(this.config.profilesDir, sanitizeFileName(profileName));
+    await fs.mkdir(profileDir, { recursive: true });
+    const launch = await this.buildCamoufoxLaunchOptions(headless);
+
+    let context;
+    try {
+      context = await firefox.launchPersistentContext(profileDir, {
+        ...launch,
+        viewport: { width: 1440, height: 900 },
+        acceptDownloads: true
+      });
+    } catch (error) {
+      if (this.isLikelyProfileBusyLaunchError(error)) {
+        throw this.createProfileBusyError(profileName, profileDir);
+      }
+      throw error;
+    }
+
+    const session = {
+      id: sessionId,
+      createdAt: nowIso(),
+      lastAccessAt: Date.now(),
+      persistent: true,
+      authMode,
+      profileName,
       profileDir,
       context,
-      ownsBrowser,
+      ownsBrowser: true,
       headless,
       tabs: new Map()
     };
@@ -1697,6 +1731,28 @@ export class BrowserRuntime {
     const next = prev.then(() => operation(), () => operation());
     this.tabLocks.set(tabId, next.catch(() => {}));
     return next;
+  }
+
+  async withProfileLock(profileName, operation) {
+    const key = profileName || '__default__';
+    const prev = this.profileLocks.get(key) || Promise.resolve();
+
+    let release;
+    const gate = new Promise((resolve) => {
+      release = resolve;
+    });
+
+    this.profileLocks.set(key, gate);
+    await prev.catch(() => {});
+
+    try {
+      return await operation();
+    } finally {
+      release();
+      if (this.profileLocks.get(key) === gate) {
+        this.profileLocks.delete(key);
+      }
+    }
   }
 
   mergeAriaAndDomRefs(ariaRefs, domCandidates) {
